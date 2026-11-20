@@ -20,7 +20,9 @@ docker compose up --build
 
 ## 2. 提交报告包
 
-`POST /fhir`，请求头必须携带接入单号：
+### 2.1 普通提交 `POST /fhir`（整包，≤20 项）
+
+请求头必须携带接入单号：
 
 ```
 Idempotency-Key: LAB-ACC-1001
@@ -100,6 +102,71 @@ Content-Type: application/json
 - 更新包内引用已存在资源请使用绝对引用（`Patient/<id>`、`Observation/<id>`）；
   `urn:uuid` 仅在同一 Bundle 内、且对应条目存在时有效。
 
+### 2.2 大来件提交 `POST /fhir/intake`（按来件编号，≤100 项，分组续交）
+
+一次检验科报告可能超过 20 项。大来件接口按**来件编号**（请求头
+`Accession-Number`）接收最多 **100 项、仅含 `POST` 条目**的 FHIR R4
+transaction Bundle，并在仓前完成整体校验后按依赖组依次入仓。
+
+```
+Accession-Number: LAB-ACC-2001
+Content-Type: application/json
+```
+
+请求体与 `POST /fhir` 相同（`Bundle.type = transaction`），但引用规则更严格：
+
+- `Observation.subject`、`DiagnosticReport.subject` 和
+  `DiagnosticReport.result` **只能是本件内的 `urn:uuid` 引用**；绝对引用
+  （`Patient/<id>`、`Observation/<id>`）或外部引用一律 `400`。
+- 每个 `urn:uuid` 必须能解析到本件内的条目（可前向/乱序），否则 `422`。
+- 通过 `subject` / `result` 直接或间接相连的条目属于**同一组**；单组仍受
+  **20 项**上限约束，超限 → `400`。整件最多 100 项。
+
+提交按**各组首次出现的位置**依次进行，每组在一个数据库事务中连同其回执
+一起提交：
+
+- 某组失败即停止，后续组不再提交；**已成功组仍可通过普通读取接口查询**。
+- 失败组整体回滚，不留资源。
+- 响应为 `transaction-response` Bundle，含 `status`（`completed` /
+  `partial`）、按**原条目位置**排序的 `resourceMap`、各组状态 `groups[]`、
+  以及失败位置 `failure`（`groupIndex` / `requestIndex` / `status` /
+  `outcome`）。HTTP 状态仍为 `200`；响应头 `X-Intake-Status` 标明结果，
+  部分成功时另带 `X-Intake-Failed-Group` / `X-Intake-Failed-Entry`。
+
+**用同编号 + 原内容重提**：
+
+- 跳过已成功组，续交未完成组，按原条目位置返回完整资源映射与失败位置；
+- 全部组完成后同内容重提返回逐字节一致的回执，不重复入仓；
+- 同编号 + 异内容 → `409`；
+- 组进度持久化在 PostgreSQL，**服务重启后**仍可续交；
+- 并发重提由组记录行锁串行化，已完成组不会被重复应用。
+
+示例（Swagger UI 的 `/docs` 中该接口自带可直接提交的两组示例，改一下
+`Accession-Number` 即可演示；把第二组改坏再提交可演示部分成功与续交）：
+
+```bash
+curl -X POST http://localhost:8000/fhir/intake \
+  -H 'Accession-Number: LAB-ACC-2001' \
+  -H 'Content-Type: application/json' \
+  -d @large-bundle.json
+```
+
+**在 `/docs` 演示提交与续交**：
+
+1. 打开 <http://localhost:8000/docs> → `POST /fhir/intake` → *Try it out*；
+   `Accession-Number` 填 `LAB-ACC-2001`，请求体选示例
+   **“Two groups under one accession number”** → *Execute*：应返回
+   `status: completed`、按原位置排序的 `resourceMap` 和两组 `completed`。
+2. 把 `Accession-Number` 改成 `LAB-ACC-DEMO-FAIL`，请求体选示例
+   **“Partial failure + resume demo”** → *Execute*：第 1 组 `completed`，
+   第 2 组 `failed`（`failure.requestIndex = 5`），`resourceMap` 仅含第 1 组
+   的 0、1 两个位置；响应头 `X-Intake-Status: partial`。用返回的患者 `id`
+   调 `GET /patients/{id}/observations`，可看到第 1 组已可查询。
+3. 不改请求体与编号，再点一次 *Execute*：返回完全相同的部分回执，
+   第 1 组不会重复入仓（观测数不变）。把第 2 组报告与观测改为同一患者后
+   以同编号提交会得到 `409`（同号不同文），需换新编号。
+4. 服务重启后再用同编号 + 原内容调用，会跳过已成功组、只续交未完成组。
+
 ## 3. 回执与读取接口
 
 提交成功返回 `transaction-response` Bundle：
@@ -140,6 +207,8 @@ Content-Type: application/json
    - 失败的提交会释放幂等槽，修正后可用同一单号重试；
    - 幂等状态持久化在 PostgreSQL，进程重启/响应丢失后重试仍然安全。
 7. 所有错误均返回 FHIR `OperationOutcome`（`application/fhir+json`）。
+8. **大来件接口**（`POST /fhir/intake`）的规则见 §2.2：全件预校验通过后
+   才入仓；组内原子、组间顺序；同编号同内容可断点续交、异内容拒绝。
 
 ## 5. 本地开发与自测（无需 Docker）
 
@@ -161,14 +230,15 @@ app/
   main.py            FastAPI 入口、异常处理
   config.py          环境配置
   database.py        引擎/会话/建表
-  models.py          ORM（患者/标识/观测/报告/关联/版本/幂等账本，PG JSONB）
+  models.py          ORM（患者/标识/观测/报告/关联/版本/幂等账本/大来件账本，PG JSONB）
   errors.py          OperationOutcome 错误体系
   fhir_utils.py      ETag/版本工具
-  routers/           /fhir 提交与资源读取路由
+  routers/           /fhir、/fhir/intake 提交与资源读取路由
   services/
     bundle.py        Bundle 校验、幂等、事务处理、患者一致性规则
+    intake.py        大来件校验、依赖分组、逐组事务、断点续交
     queries.py       读取与历史查询
 scripts/entrypoint.sh  容器启动（等库+建表）
-tests/               25 个 pytest 用例（含并发、重启、原子性）
+tests/               59 个 pytest 用例（含并发、重启、原子性、大来件续交）
 docker-compose.yml   db + api 两服务，含健康检查
 ```

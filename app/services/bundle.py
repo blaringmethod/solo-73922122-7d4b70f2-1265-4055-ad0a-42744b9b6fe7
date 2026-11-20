@@ -95,7 +95,14 @@ def content_hash(bundle: dict) -> str:
 # Validation (no database access)
 # --------------------------------------------------------------------------- #
 
-def validate_bundle(bundle: object) -> list[ParsedEntry]:
+def validate_bundle(
+    bundle: object,
+    *,
+    max_entries: int | None = None,
+    post_only: bool = False,
+    require_urn_refs: bool = False,
+    dedupe_patient_identifiers: bool = True,
+) -> list[ParsedEntry]:
     if not isinstance(bundle, dict):
         raise bad_request("Request body must be a JSON FHIR Bundle object.")
     if bundle.get("resourceType") != "Bundle":
@@ -105,9 +112,10 @@ def validate_bundle(bundle: object) -> list[ParsedEntry]:
     raw_entries = bundle.get("entry")
     if not isinstance(raw_entries, list) or not raw_entries:
         raise bad_request("Bundle.entry must be a non-empty array.")
-    if len(raw_entries) > settings.MAX_BUNDLE_ENTRIES:
+    limit = settings.MAX_BUNDLE_ENTRIES if max_entries is None else max_entries
+    if len(raw_entries) > limit:
         raise bad_request(
-            f"Bundle contains {len(raw_entries)} entries; limit is {settings.MAX_BUNDLE_ENTRIES}."
+            f"Bundle contains {len(raw_entries)} entries; limit is {limit}."
         )
 
     entries: list[ParsedEntry] = []
@@ -128,6 +136,11 @@ def validate_bundle(bundle: object) -> list[ParsedEntry]:
         if not isinstance(request, dict):
             raise bad_request(f"Bundle.entry[{i}] must contain a 'request' object.")
         method = request.get("method")
+        if post_only and method != "POST":
+            raise bad_request(
+                f"Bundle.entry[{i}].request.method must be POST in a large-intake "
+                f"Bundle."
+            )
         if method not in ("POST", "PUT"):
             raise bad_request(
                 f"Bundle.entry[{i}].request.method '{method}' not supported; use POST or PUT."
@@ -192,18 +205,32 @@ def validate_bundle(bundle: object) -> list[ParsedEntry]:
         )
 
         if rtype == "Patient":
-            _validate_patient_entry(entry, seen_bundle_identifiers)
+            _validate_patient_entry(
+                entry,
+                seen_bundle_identifiers,
+                dedupe=dedupe_patient_identifiers,
+            )
         elif rtype == "Observation":
-            _validate_referencing_entry(entry, "subject", "Patient", i)
+            _validate_referencing_entry(
+                entry, "subject", "Patient", i, require_urn=require_urn_refs
+            )
         elif rtype == "DiagnosticReport":
-            _validate_referencing_entry(entry, "subject", "Patient", i)
+            _validate_referencing_entry(
+                entry, "subject", "Patient", i, require_urn=require_urn_refs
+            )
             results = resource.get("result")
             if not isinstance(results, list) or not results:
                 raise bad_request(
                     f"Bundle.entry[{i}]: DiagnosticReport.result must be a non-empty array."
                 )
             for ref in results:
-                _validate_ref_shape(ref, i, "DiagnosticReport.result", "Observation")
+                _validate_ref_shape(
+                    ref,
+                    i,
+                    "DiagnosticReport.result",
+                    "Observation",
+                    require_urn=require_urn_refs,
+                )
 
         entries.append(entry)
 
@@ -229,12 +256,19 @@ def _identifier_pairs(resource: dict) -> list[tuple[str, str]]:
     return pairs
 
 
-def _validate_patient_entry(entry: ParsedEntry, seen: set[tuple[str, str]]) -> None:
+def _validate_patient_entry(
+    entry: ParsedEntry,
+    seen: set[tuple[str, str]],
+    *,
+    dedupe: bool = True,
+) -> None:
     if entry.method == "PUT":
         raise bad_request(
             f"Bundle.entry[{entry.index}]: Patient supports conditional create (POST) only."
         )
     pairs = _identifier_pairs(entry.resource)
+    if not dedupe:
+        return
     for pair in pairs:
         if pair in seen:
             raise bad_request(
@@ -244,10 +278,22 @@ def _validate_patient_entry(entry: ParsedEntry, seen: set[tuple[str, str]]) -> N
         seen.add(pair)
 
 
-def _validate_ref_shape(ref: object, index: int, path: str, expected_type: str) -> str:
+def _validate_ref_shape(
+    ref: object,
+    index: int,
+    path: str,
+    expected_type: str,
+    *,
+    require_urn: bool = False,
+) -> str:
     if not isinstance(ref, dict) or not isinstance(ref.get("reference"), str):
         raise bad_request(f"Bundle.entry[{index}]: {path} entries need a 'reference' string.")
     reference = ref["reference"].strip()
+    if require_urn and not URN_UUID_RE.match(reference):
+        raise bad_request(
+            f"Bundle.entry[{index}]: {path} reference '{reference}' must be an internal "
+            f"urn:uuid reference in a large-intake Bundle."
+        )
     if URN_UUID_RE.match(reference) or ABSOLUTE_REF_RE.match(reference):
         kind = reference.split("/", 1)[0] if "/" in reference else None
         if kind is not None and kind != expected_type:
@@ -263,10 +309,17 @@ def _validate_ref_shape(ref: object, index: int, path: str, expected_type: str) 
 
 
 def _validate_referencing_entry(
-    entry: ParsedEntry, field_name: str, expected_type: str, index: int
+    entry: ParsedEntry,
+    field_name: str,
+    expected_type: str,
+    index: int,
+    *,
+    require_urn: bool = False,
 ) -> None:
     subject = entry.resource.get(field_name)
-    ref = _validate_ref_shape(subject, index, field_name, expected_type)
+    ref = _validate_ref_shape(
+        subject, index, field_name, expected_type, require_urn=require_urn
+    )
     entry.subject_ref = ref
 
 
@@ -373,20 +426,7 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
         return _canonicalize(replay)
 
     try:
-        patient_entries = [e for e in entries if e.resource_type == "Patient"]
-        observation_entries = [e for e in entries if e.resource_type == "Observation"]
-        report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
-
-        patient_rows = _resolve_patients(session, patient_entries)
-        _resolve_subjects(session, entries, patient_rows)
-        obs_rows = _resolve_observations(session, observation_entries, patient_rows, entries)
-        report_rows = _resolve_reports(session, report_entries, entries, obs_rows)
-
-        _validate_patient_alignment(entries, obs_rows, report_rows, session)
-
-        _apply_observations(session, observation_entries, obs_rows, patient_rows, entries)
-        _apply_reports(session, report_entries, report_rows, obs_rows, entries)
-
+        apply_entries(session, entries)
         receipt = _build_receipt(entries, idempotency_key)
         store_completed_response(session, idempotency_key, receipt)
         session.commit()
@@ -406,6 +446,27 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
         except Exception:  # pragma: no cover - defensive
             session.rollback()
         raise
+
+
+def apply_entries(session: Session, entries: list[ParsedEntry]) -> None:
+    """Apply already-validated entries inside the caller's transaction.
+
+    Nothing is committed here, so the caller controls atomicity (one bundle, or
+    one dependency group of a large intake).
+    """
+    patient_entries = [e for e in entries if e.resource_type == "Patient"]
+    observation_entries = [e for e in entries if e.resource_type == "Observation"]
+    report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
+
+    patient_rows = _resolve_patients(session, patient_entries)
+    _resolve_subjects(session, entries, patient_rows)
+    obs_rows = _resolve_observations(session, observation_entries, patient_rows, entries)
+    report_rows = _resolve_reports(session, report_entries, entries, obs_rows)
+
+    _validate_patient_alignment(entries, obs_rows, report_rows, session)
+
+    _apply_observations(session, observation_entries, obs_rows, patient_rows, entries)
+    _apply_reports(session, report_entries, report_rows, obs_rows, entries)
 
 
 # --------------------------------------------------------------------------- #
@@ -847,15 +908,11 @@ def _build_receipt(entries: list[ParsedEntry], idempotency_key: str) -> dict:
     response_entries = []
     resource_map = []
     for entry in sorted(entries, key=lambda e: e.index):
-        http_status = "201 Created" if entry.action in ("created",) else "200 OK"
-        if entry.resource_type == "Patient" and entry.action == "existing":
-            http_status = "200 OK"
+        http_status, location, map_entry = _entry_receipt_parts(entry)
         response_entry = {
-            "response": {
-                "status": http_status,
-                "etag": etag(entry.version or 1),
-                "location": f"{entry.resource_type}/{entry.row_id}/_history/{entry.version}",
-            },
+            "response": {"status": http_status, "etag": etag(entry.version or 1),
+                         "location": location},
+            # Kept for backward compatibility with the original /fhir receipt.
             "resourceMap": {
                 "resourceType": entry.resource_type,
                 "id": entry.row_id,
@@ -866,17 +923,7 @@ def _build_receipt(entries: list[ParsedEntry], idempotency_key: str) -> dict:
         if entry.full_url:
             response_entry["fullUrl"] = entry.full_url
         response_entries.append(response_entry)
-        resource_map.append(
-            {
-                "requestIndex": entry.index,
-                "method": entry.method,
-                "resourceType": entry.resource_type,
-                "id": entry.row_id,
-                "version": entry.version,
-                "action": entry.action,
-                "fullUrl": entry.full_url,
-            }
-        )
+        resource_map.append(map_entry)
 
     return {
         "resourceType": "Bundle",
@@ -885,3 +932,32 @@ def _build_receipt(entries: list[ParsedEntry], idempotency_key: str) -> dict:
         "entry": response_entries,
         "resourceMap": resource_map,
     }
+
+
+def entry_receipt_parts(entry: ParsedEntry) -> tuple[dict, dict]:
+    """(response entry, resourceMap item) for one applied entry."""
+    http_status, location, map_entry = _entry_receipt_parts(entry)
+    response_entry = {
+        "response": {"status": http_status, "etag": etag(entry.version or 1),
+                     "location": location},
+    }
+    if entry.full_url:
+        response_entry["fullUrl"] = entry.full_url
+    return response_entry, map_entry
+
+
+def _entry_receipt_parts(entry: ParsedEntry) -> tuple[str, str, dict]:
+    http_status = "201 Created" if entry.action in ("created",) else "200 OK"
+    if entry.resource_type == "Patient" and entry.action == "existing":
+        http_status = "200 OK"
+    location = f"{entry.resource_type}/{entry.row_id}/_history/{entry.version}"
+    map_entry = {
+        "requestIndex": entry.index,
+        "method": entry.method,
+        "resourceType": entry.resource_type,
+        "id": entry.row_id,
+        "version": entry.version,
+        "action": entry.action,
+        "fullUrl": entry.full_url,
+    }
+    return http_status, location, map_entry

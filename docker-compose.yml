@@ -22,6 +22,9 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg2://research:research@db:5432/researchdb
+      MAX_BUNDLE_ENTRIES: "20"
+      MAX_INTAKE_ENTRIES: "100"
+      MAX_INTAKE_GROUP_ENTRIES: "20"
     ports:
       - "8000:8000"
 

@@ -160,3 +160,71 @@ class IdempotencyRecord(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class IntakeRecord(Base):
+    """Ledger entry for one large incoming report (来件), keyed by accession no.
+
+    The ``content_hash`` binds the accession number to exactly one payload for
+    the lifetime of the record. Group progress is persisted separately so a
+    retry (or a restart) can resume where the previous attempt stopped.
+    """
+
+    __tablename__ = "intake_records"
+
+    accession_number: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), default="processing"
+    )  # processing|partial|completed
+    response: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    groups: Mapped[list["IntakeGroupRecord"]] = relationship(
+        back_populates="intake",
+        cascade="all, delete-orphan",
+        order_by="IntakeGroupRecord.group_index",
+        lazy="selectin",
+    )
+
+
+class IntakeGroupRecord(Base):
+    """Per-group progress: pending, completed or failed.
+
+    ``entry_indexes`` holds the original positions inside the submitted Bundle,
+    so every receipt can report resources and failures against the caller's
+    original entry order after a partial resume.
+    """
+
+    __tablename__ = "intake_groups"
+    __table_args__ = (
+        UniqueConstraint(
+            "accession_number", "group_index", name="uq_intake_group"
+        ),
+        Index("ix_intake_groups_accession", "accession_number", "group_index"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    accession_number: Mapped[str] = mapped_column(
+        ForeignKey("intake_records.accession_number", ondelete="CASCADE"),
+        nullable=False,
+    )
+    group_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_entry_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_indexes: Mapped[list] = mapped_column(JsonType, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), default="pending"
+    )  # pending|completed|failed
+    response: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    error_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_response: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    error_entry_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    intake: Mapped[IntakeRecord] = relationship(back_populates="groups")
